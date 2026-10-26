@@ -17,6 +17,28 @@ A React Native library powered by [NitroModules](https://nitro.margelo.com/) tha
 - **Permission Management** - Built-in camera and microphone permission handling
 - **React Hooks** - Convenient hooks for permissions and global recording management
 
+## Microphone availability
+
+For global recording, `getExtensionStatus().isMicrophoneEnabled` reports native
+microphone availability rather than only the requested recording configuration:
+
+- iOS requires an accepted microphone buffer within the last three seconds.
+  Each new chunk resets this signal until its writer accepts microphone data.
+  Status is published on audio callbacks as well as video callbacks, so a static
+  screen does not make healthy audio appear stalled. Quiet audio remains valid.
+- Android 10+ requires an active MediaRecorder audio recording configuration that
+  the OS has not silenced. Android 7-9 can only check recorder validity. A deliberate
+  pause between chunks preserves availability while the projection session remains
+  active; require `isCapturingChunk` as well when checking an individual chunk.
+
+Allow a short recovery window after starting or foregrounding before treating an
+unavailable microphone as a persistent failure. Android's public recorder status
+does not prove fresh encoded buffers. These checks do not prove audible speech,
+video-frame progress, or the validity of a finalized separate audio file.
+
+Native changes require rebuilding both platforms. For Expo on iOS, also run
+prebuild to update the broadcast extension. An OTA JavaScript update is insufficient.
+
 ## Demo
 
 |                          iOS In-App Recording                          |                   iOS Global Recording                    |                     Android Global Recording                      |

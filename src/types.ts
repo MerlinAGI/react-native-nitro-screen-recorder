@@ -387,6 +387,8 @@ export interface RawExtensionStatus {
   isMicrophoneEnabled: boolean;
   /** Whether actively capturing a chunk (after markChunkStart, before finalizeChunk) */
   isCapturingChunk: boolean;
+  /** A writer is being saved/replaced; microphone sample delivery may pause. */
+  isFinalizingChunk: boolean;
   /** Unix timestamp (seconds) when the current chunk started, or 0 if not capturing */
   chunkStartedAt: number;
   /**

@@ -27,6 +27,7 @@ const IDLE_STATUS: ExtensionStatus = {
   state: 'idle',
   isMicrophoneEnabled: false,
   isCapturingChunk: false,
+  isFinalizingChunk: false,
   chunkStartedAt: 0,
   captureMode: 'unknown',
 };

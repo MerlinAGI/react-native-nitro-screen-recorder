@@ -1385,18 +1385,22 @@ class NitroScreenRecorder: HybridNitroScreenRecorderSpec {
       return RawExtensionStatus(
         isMicrophoneEnabled: false,
         isCapturingChunk: false,
+        isFinalizingChunk: false,
         chunkStartedAt: 0,
         captureMode: .entirescreen  // iOS always captures entire screen
       )
     }
 
-    let isMicrophoneEnabled = defaults.bool(forKey: "ExtensionMicActive")
+    let lastMicBufferAt = defaults.double(forKey: "ExtensionLastMicBufferAt")
+    let micBufferAge = Date().timeIntervalSince1970 - lastMicBufferAt
+    let isMicrophoneEnabled = lastMicBufferAt > 0 && micBufferAge >= 0 && micBufferAge < 3
     let isCapturingChunk = defaults.bool(forKey: "ExtensionCapturing")
     let chunkStartedAt = defaults.double(forKey: "ExtensionChunkStartedAt")
 
     return RawExtensionStatus(
       isMicrophoneEnabled: isMicrophoneEnabled,
       isCapturingChunk: isCapturingChunk,
+      isFinalizingChunk: defaults.bool(forKey: "ExtensionFinalizingChunk"),
       chunkStartedAt: chunkStartedAt,
       captureMode: .entirescreen  // iOS always captures entire screen
     )
