@@ -565,8 +565,10 @@ class NitroScreenRecorder : HybridNitroScreenRecorderSpec() {
     return Promise.async {
       Log.d(TAG, "📍 markChunkStart called with chunkId=$chunkId")
       val startTime = System.currentTimeMillis()
-      val service = globalRecordingService
-        ?: throw IllegalStateException("CHUNK_START_FAILED:no-active-service")
+      val service = globalRecordingService ?: run {
+        Log.w(TAG, "⚠️ markChunkStart: Service not bound")
+        throw IllegalStateException("CHUNK_START_FAILED:no-active-service")
+      }
       service.markChunkStart()
       currentChunkId = chunkId
       val elapsedMs = (System.currentTimeMillis() - startTime).toDouble()

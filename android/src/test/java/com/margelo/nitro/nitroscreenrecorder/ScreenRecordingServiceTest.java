@@ -4,6 +4,7 @@ import static org.junit.Assert.*;
 
 import android.hardware.display.VirtualDisplay;
 import android.media.MediaRecorder;
+import android.util.Log;
 import android.view.Surface;
 import java.io.File;
 import java.util.ArrayList;
@@ -26,6 +27,7 @@ import org.robolectric.annotation.Implementation;
 import org.robolectric.annotation.Implements;
 import org.robolectric.shadow.api.Shadow;
 import org.robolectric.shadows.ShadowMediaRecorder;
+import org.robolectric.shadows.ShadowLog;
 import org.robolectric.util.ReflectionHelpers;
 
 @RunWith(RobolectricTestRunner.class)
@@ -38,6 +40,7 @@ public class ScreenRecordingServiceTest {
 
   @Before
   public void setUp() {
+    ShadowLog.clear();
     RecorderShadow.recorders.clear();
     RecorderShadow.failureStage = null;
     RecorderShadow.onStart = null;
@@ -88,6 +91,8 @@ public class ScreenRecordingServiceTest {
     IllegalStateException failure = assertThrows(IllegalStateException.class, service::markChunkStart);
     assertTrue(failure.getMessage().startsWith("CHUNK_START_FAILED:" + stage));
     assertSame(RecorderShadow.failure, failure.getCause());
+    assertTrue(ShadowLog.getLogsForTag("ScreenRecordingService").stream().anyMatch(
+        entry -> entry.type == Log.ERROR && entry.throwable == failure.getCause()));
     assertFalse(service.isCapturingChunk());
     assertFalse(service.isCurrentlyRecording());
     assertEquals(0.0, service.getChunkStartedAt(), 0.0);

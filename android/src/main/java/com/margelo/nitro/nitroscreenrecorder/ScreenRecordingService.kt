@@ -412,8 +412,11 @@ class ScreenRecordingService : Service() {
    */
   @Synchronized
   fun markChunkStart() {
-    val display = virtualDisplay
-      ?: throw IllegalStateException("CHUNK_START_FAILED:no-virtual-display")
+    Log.d(TAG, "📍 markChunkStart called")
+    val display = virtualDisplay ?: run {
+      Log.w(TAG, "⚠️ markChunkStart: No VirtualDisplay - call startGlobalRecording first")
+      throw IllegalStateException("CHUNK_START_FAILED:no-virtual-display")
+    }
     val oldRecorder = mediaRecorder
     val oldFile = currentRecordingFile
     val oldSurface = display.surface
@@ -430,6 +433,7 @@ class ScreenRecordingService : Service() {
       // Each attempt owns its file, including starts within the same second.
       val outputFile = File.createTempFile("chunk_", ".mp4", recordingsDir)
       newFile = outputFile
+      Log.d(TAG, "📁 Created output file: ${outputFile.absolutePath}")
       stage = "configure"
       val recorder = RecorderUtils.setupMediaRecorder(
         this,
@@ -447,10 +451,12 @@ class ScreenRecordingService : Service() {
       // Attach only after start so the display receives a ready surface.
       recorder.start()
       didStartRecorder = true
+      Log.d(TAG, "📍 New chunk recorder started")
       stage = "attach-surface"
       val newSurface = recorder.surface
       didAttemptSurfaceSwap = true
       display.setSurface(newSurface)
+      Log.d(TAG, "📍 VirtualDisplay surface swapped to new recorder")
 
       mediaRecorder = recorder
       currentRecordingFile = outputFile
@@ -474,18 +480,26 @@ class ScreenRecordingService : Service() {
         .onFailure { Log.w(TAG, "Failed to release rejected chunk recorder", it) }
       runCatching { newFile?.delete() }
         .onFailure { Log.w(TAG, "Failed to delete rejected chunk file", it) }
+      Log.e(TAG, "❌ Error in markChunkStart at $stage: ${e.message}", e)
       // The caller owns recovery; a global error callback would stop its retry.
       throw IllegalStateException("CHUNK_START_FAILED:$stage: $e", e)
     }
 
     if (oldRecorder != null) {
       runCatching { oldRecorder.stop() }
+        .onSuccess { Log.d(TAG, "📍 Old recorder stopped") }
         .onFailure { Log.w(TAG, "Failed to stop previous chunk recorder", it) }
       runCatching { oldRecorder.release() }
         .onFailure { Log.w(TAG, "Failed to release previous chunk recorder", it) }
       runCatching { oldFile?.delete() }
+        .onSuccess { didDelete ->
+          if (didDelete == true) Log.d(TAG, "📍 Pre-chunk content discarded")
+        }
         .onFailure { Log.w(TAG, "Failed to delete previous chunk file", it) }
+    } else {
+      Log.d(TAG, "📍 No old recorder (starting fresh chunk after finalize)")
     }
+    Log.d(TAG, "📍 Chunk started at $chunkStartedAt (seamless surface swap)")
   }
 
   /**
