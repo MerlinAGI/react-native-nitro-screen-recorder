@@ -2,6 +2,7 @@ package com.margelo.nitro.nitroscreenrecorder;
 
 import static org.junit.Assert.*;
 
+import android.app.Notification;
 import android.hardware.display.VirtualDisplay;
 import android.media.MediaRecorder;
 import android.util.Log;
@@ -28,6 +29,7 @@ import org.robolectric.annotation.Implements;
 import org.robolectric.shadow.api.Shadow;
 import org.robolectric.shadows.ShadowMediaRecorder;
 import org.robolectric.shadows.ShadowLog;
+import org.robolectric.shadows.ShadowService;
 import org.robolectric.util.ReflectionHelpers;
 
 @RunWith(RobolectricTestRunner.class)
@@ -133,12 +135,23 @@ public class ScreenRecordingServiceTest {
   }
 
   @Test
-  public void failedSurfaceRestoreClearsCaptureAndEndsBrokenSession() {
+  public void failedSurfaceRestoreStopsForegroundServiceAndRemovesNotification() {
+    service.onStartCommand(null, 0, 42);
+    service.startForeground(1001, new Notification.Builder(service, "screen_recording_channel").build());
+    ShadowService serviceState = Shadow.extract(service);
+    assertNotNull(serviceState.getLastForegroundNotification());
+    assertFalse(serviceState.isStoppedBySelf());
     service.markChunkStart();
     display.failuresRemaining = 2;
     IllegalStateException failure = assertThrows(IllegalStateException.class, service::markChunkStart);
     assertEquals(1, failure.getCause().getSuppressed().length);
     assertTrue(display.isReleased);
+    assertTrue(serviceState.isForegroundStopped());
+    assertNull(serviceState.getLastForegroundNotification());
+    assertTrue(serviceState.isStoppedBySelf());
+    assertEquals(42, serviceState.getStopSelfId());
+    assertFalse(service.hasActiveSession());
+    assertFalse(ScreenRecordingService.Companion.isSessionActive());
     assertTrue(RecorderShadow.recorders.get(0).didStop);
     assertTrue(RecorderShadow.recorders.get(1).didStop);
     assertFalse(service.isCapturingChunk());

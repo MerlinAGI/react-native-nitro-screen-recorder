@@ -470,6 +470,14 @@ class ScreenRecordingService : Service() {
           // An unconfirmed surface cannot remain advertised as active capture.
           runCatching { oldRecorder?.stop() }.onFailure { e.addSuppressed(it) }
           cleanup()
+          runCatching { stopForeground(true) }.onFailure { e.addSuppressed(it) }
+          runCatching { stopSelf(this.startId) }.onFailure { e.addSuppressed(it) }
+          runCatching {
+            NitroScreenRecorder.notifyGlobalRecordingEvent(ScreenRecordingEvent(
+              type = RecordingEventType.GLOBAL,
+              reason = RecordingEventReason.ENDED
+            ))
+          }.onFailure { e.addSuppressed(it) }
         }
       }
       if (didStartRecorder) {
