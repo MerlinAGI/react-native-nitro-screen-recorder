@@ -336,6 +336,7 @@ class ScreenRecordingService : Service() {
     }
   }
 
+  @Synchronized
   fun stopRecording(): File? {
     Log.d(TAG, "🛑 stopRecording called")
 
@@ -409,88 +410,104 @@ class ScreenRecordingService : Service() {
    * - After startGlobalRecording() to begin first chunk (discards pre-chunk content)
    * - After finalizeChunk() to begin next chunk (VirtualDisplay still exists, no active recorder)
    */
+  @Synchronized
   fun markChunkStart() {
     Log.d(TAG, "📍 markChunkStart called")
-
-    if (virtualDisplay == null) {
+    val display = virtualDisplay ?: run {
       Log.w(TAG, "⚠️ markChunkStart: No VirtualDisplay - call startGlobalRecording first")
-      val error = RecordingError(
-        name = "ChunkStartError",
-        message = "No active recording session. Call startGlobalRecording first."
-      )
-      NitroScreenRecorder.notifyGlobalRecordingError(error)
-      return
+      throw IllegalStateException("CHUNK_START_FAILED:no-virtual-display")
     }
+    val oldRecorder = mediaRecorder
+    val oldFile = currentRecordingFile
+    val oldSurface = display.surface
+    var didStartRecorder = false
+    var didAttemptSurfaceSwap = false
+    var newRecorder: MediaRecorder? = null
+    var newFile: File? = null
+    var stage = "create-file"
 
     try {
-      // Save references to old recorder/file (may be null if coming from finalizeChunk)
-      val oldRecorder = mediaRecorder
-      val oldFile = currentRecordingFile
-
-      // Create new recording file for the chunk
       val base = applicationContext.externalCacheDir ?: applicationContext.filesDir
       val recordingsDir = File(base, "recordings")
-      val newRecordingFile = RecorderUtils.createOutputFile(recordingsDir, "chunk")
-
-      // Create and prepare new MediaRecorder
-      val newRecorder = RecorderUtils.setupMediaRecorder(
+      recordingsDir.mkdirs()
+      // Each attempt owns its file, including starts within the same second.
+      val outputFile = File.createTempFile("chunk_", ".mp4", recordingsDir)
+      newFile = outputFile
+      Log.d(TAG, "📁 Created output file: ${outputFile.absolutePath}")
+      stage = "configure"
+      val recorder = RecorderUtils.setupMediaRecorder(
         this,
         enableMic,
-        newRecordingFile,
+        outputFile,
         recordingProfile.width,
         recordingProfile.height,
         recordingProfile.videoBitrate,
         recordingProfile.frameRate
       )
-      newRecorder.prepare()
-
-      // IMPORTANT: Start the new recorder BEFORE swapping the surface
-      // This ensures frames are written to a fully initialized recorder
-      newRecorder.start()
+      newRecorder = recorder
+      stage = "prepare"
+      recorder.prepare()
+      stage = "start"
+      // Attach only after start so the display receives a ready surface.
+      recorder.start()
+      didStartRecorder = true
       Log.d(TAG, "📍 New chunk recorder started")
-
-      // SEAMLESS SWAP: Update the VirtualDisplay surface to point to new recorder
-      // This redirects the screen capture to the running recorder
-      virtualDisplay?.setSurface(newRecorder.surface)
+      stage = "attach-surface"
+      val newSurface = recorder.surface
+      didAttemptSurfaceSwap = true
+      display.setSurface(newSurface)
       Log.d(TAG, "📍 VirtualDisplay surface swapped to new recorder")
 
-      // Update references
-      mediaRecorder = newRecorder
-      currentRecordingFile = newRecordingFile
+      mediaRecorder = recorder
+      currentRecordingFile = outputFile
       isRecording = true
-
-      // Clean up old recorder if it exists (content is pre-chunk, discard it)
-      if (oldRecorder != null) {
-        try {
-          oldRecorder.stop()
-          oldRecorder.release()
-          // Delete the old file - this was pre-chunk content
-          oldFile?.delete()
-          Log.d(TAG, "📍 Old recorder stopped and pre-chunk content discarded")
-        } catch (e: Exception) {
-          Log.w(TAG, "⚠️ Error stopping old recorder: ${e.message}")
-          // Still try to delete the file
-          oldFile?.delete()
-        }
-      } else {
-        Log.d(TAG, "📍 No old recorder (starting fresh chunk after finalize)")
-      }
-
-      // Update chunking state
       isCapturing = true
       chunkStartedAt = System.currentTimeMillis() / 1000.0
-
-      Log.d(TAG, "📍 Chunk started at $chunkStartedAt (seamless surface swap)")
-
     } catch (e: Exception) {
-      Log.e(TAG, "❌ Error in markChunkStart: ${e.message}")
-      e.printStackTrace()
-      val error = RecordingError(
-        name = "ChunkStartError",
-        message = e.message ?: "Failed to start chunk"
-      )
-      NitroScreenRecorder.notifyGlobalRecordingError(error)
+      if (didAttemptSurfaceSwap) {
+        runCatching { display.setSurface(oldSurface) }.onFailure {
+          e.addSuppressed(it)
+          // An unconfirmed surface cannot remain advertised as active capture.
+          runCatching { oldRecorder?.stop() }.onFailure { e.addSuppressed(it) }
+          cleanup()
+          runCatching { stopForeground(true) }.onFailure { e.addSuppressed(it) }
+          runCatching { stopSelf(this.startId) }.onFailure { e.addSuppressed(it) }
+          runCatching {
+            NitroScreenRecorder.notifyGlobalRecordingEvent(ScreenRecordingEvent(
+              type = RecordingEventType.GLOBAL,
+              reason = RecordingEventReason.ENDED
+            ))
+          }.onFailure { e.addSuppressed(it) }
+        }
+      }
+      if (didStartRecorder) {
+        runCatching { newRecorder?.stop() }
+          .onFailure { e.addSuppressed(it) }
+      }
+      runCatching { newRecorder?.release() }
+        .onFailure { Log.w(TAG, "Failed to release rejected chunk recorder", it) }
+      runCatching { newFile?.delete() }
+        .onFailure { Log.w(TAG, "Failed to delete rejected chunk file", it) }
+      Log.e(TAG, "❌ Error in markChunkStart at $stage: ${e.message}", e)
+      // The caller owns recovery; a global error callback would stop its retry.
+      throw IllegalStateException("CHUNK_START_FAILED:$stage: $e", e)
     }
+
+    if (oldRecorder != null) {
+      runCatching { oldRecorder.stop() }
+        .onSuccess { Log.d(TAG, "📍 Old recorder stopped") }
+        .onFailure { Log.w(TAG, "Failed to stop previous chunk recorder", it) }
+      runCatching { oldRecorder.release() }
+        .onFailure { Log.w(TAG, "Failed to release previous chunk recorder", it) }
+      runCatching { oldFile?.delete() }
+        .onSuccess { didDelete ->
+          if (didDelete == true) Log.d(TAG, "📍 Pre-chunk content discarded")
+        }
+        .onFailure { Log.w(TAG, "Failed to delete previous chunk file", it) }
+    } else {
+      Log.d(TAG, "📍 No old recorder (starting fresh chunk after finalize)")
+    }
+    Log.d(TAG, "📍 Chunk started at $chunkStartedAt (seamless surface swap)")
   }
 
   /**
@@ -502,6 +519,7 @@ class ScreenRecordingService : Service() {
    * 
    * Flow: startGlobalRecording -> markChunkStart -> finalizeChunk -> markChunkStart -> finalizeChunk -> ... -> stopGlobalRecording
    */
+  @Synchronized
   fun finalizeChunk(): File? {
     Log.d(TAG, "📦 finalizeChunk called")
 
@@ -569,6 +587,7 @@ class ScreenRecordingService : Service() {
   /** Returns true if we have an active MediaProjection session (even if paused between chunks) */
   fun hasActiveSession(): Boolean = mediaProjection != null
 
+  @Synchronized
   private fun cleanup() {
     Log.d(TAG, "🧹 cleanup() called")
 
