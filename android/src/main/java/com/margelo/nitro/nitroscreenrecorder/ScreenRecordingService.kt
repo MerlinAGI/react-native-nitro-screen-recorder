@@ -574,10 +574,12 @@ class ScreenRecordingService : Service() {
         cleanup()
         runCatching { stopForeground(true) }.onFailure { Log.w(TAG, "Failed to stop foreground recording", it) }
         runCatching { stopSelf(this.startId) }.onFailure { Log.w(TAG, "Failed to stop recording service", it) }
-        NitroScreenRecorder.notifyGlobalRecordingEvent(ScreenRecordingEvent(
-          type = RecordingEventType.GLOBAL,
-          reason = RecordingEventReason.ENDED
-        ))
+        runCatching {
+          NitroScreenRecorder.notifyGlobalRecordingEvent(ScreenRecordingEvent(
+            type = RecordingEventType.GLOBAL,
+            reason = RecordingEventReason.ENDED
+          ))
+        }.onFailure { failure?.addSuppressed(it) }
       }
     }
 
