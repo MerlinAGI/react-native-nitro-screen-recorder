@@ -162,11 +162,8 @@ object RecorderUtils {
       directory.mkdirs()
     }
 
-    val timestamp =
-      SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
     // Use .m4a extension for extracted audio (AAC in MPEG-4 container)
-    val fileName = "${prefix}_$timestamp.m4a"
-    val file = File(directory, fileName)
+    val file = File.createTempFile("${prefix}_", ".m4a", directory)
     Log.d(TAG, "📁 Created audio output file: ${file.absolutePath}")
     return file
   }

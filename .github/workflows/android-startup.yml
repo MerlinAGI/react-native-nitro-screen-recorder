@@ -32,6 +32,6 @@ jobs:
       - name: Generate the example Android project
         working-directory: example
         run: yarn expo prebuild --platform android --no-install
-      - name: Compile the native module and test startup recovery
+      - name: Compile the native module and test recording recovery
         working-directory: example/android
-        run: ./gradlew :react-native-nitro-screen-recorder:testDebugUnitTest --tests '*ScreenRecordingServiceTest' --no-daemon -PreactNativeArchitectures=x86_64
+        run: ./gradlew :react-native-nitro-screen-recorder:testDebugUnitTest --no-daemon -PreactNativeArchitectures=x86_64
