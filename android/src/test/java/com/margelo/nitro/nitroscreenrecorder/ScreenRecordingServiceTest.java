@@ -37,7 +37,7 @@ import org.robolectric.shadows.ShadowMediaRecorder;
 import org.robolectric.shadows.ShadowLog;
 import org.robolectric.shadows.ShadowService;
 import org.robolectric.util.ReflectionHelpers;
-import com.facebook.react.bridge.ReactApplicationContext;
+import com.facebook.react.bridge.BridgeReactContext;
 import com.margelo.nitro.NitroModules;
 import com.margelo.nitro.core.Promise;
 
@@ -281,7 +281,7 @@ public class ScreenRecordingServiceTest {
     ReflectionHelpers.setField(bridge, "lastGlobalRecording", previous);
     service.markChunkStart();
     CountDownLatch requested = new CountDownLatch(1);
-    NitroModules.setApplicationContext(new ReactApplicationContext(service) {
+    NitroModules.setApplicationContext(new BridgeReactContext(service) {
       @Override public ComponentName startService(Intent intent) {
         requested.countDown();
         return new ComponentName(service, ScreenRecordingService.class);
@@ -309,7 +309,7 @@ public class ScreenRecordingServiceTest {
   }
 
   private NitroScreenRecorder createBridge() {
-    NitroModules.setApplicationContext(new ReactApplicationContext(service) {
+    NitroModules.setApplicationContext(new BridgeReactContext(service) {
       @Override public ComponentName startService(Intent intent) {
         service.onStartCommand(intent, 0, 42);
         return new ComponentName(service, ScreenRecordingService.class);
