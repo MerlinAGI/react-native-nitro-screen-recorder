@@ -22,6 +22,10 @@ import java.io.File
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 
 data class Listener<T>(val id: Double, val callback: T)
 data class ScreenRecordingListenerEntry(
@@ -50,6 +54,8 @@ class NitroScreenRecorder : HybridNitroScreenRecorderSpec() {
   private var globalRecordingErrorCallback: ((RecordingError) -> Unit)? = null
   private var globalRecordingInitiatedByThisPackage = false
   private var currentChunkId: String? = null
+  private val globalStopMutex = Mutex()
+  @Volatile private var pendingGlobalStop: CompletableDeferred<File?>? = null
   private val pendingGlobalRecordings = mutableListOf<CompletedGlobalRecording>()
 
   private val screenRecordingListeners = mutableListOf<ScreenRecordingListenerEntry>()
@@ -78,6 +84,7 @@ class NitroScreenRecorder : HybridNitroScreenRecorderSpec() {
       instance?.let { recorder ->
         if (event.type == RecordingEventType.GLOBAL && event.reason == RecordingEventReason.ENDED) {
           recorder.globalRecordingInitiatedByThisPackage = false
+          recorder.pendingGlobalStop?.complete(null)
         }
         recorder.notifyListeners(event)
       }
@@ -96,6 +103,7 @@ class NitroScreenRecorder : HybridNitroScreenRecorderSpec() {
         recorder.lastGlobalRecordingEnabledMicrophone = enabledMic
         if (event.type == RecordingEventType.GLOBAL && event.reason == RecordingEventReason.ENDED) {
           recorder.globalRecordingInitiatedByThisPackage = false
+          recorder.pendingGlobalStop?.complete(file)
         }
         recorder.notifyListeners(event)
       }
@@ -106,7 +114,12 @@ class NitroScreenRecorder : HybridNitroScreenRecorderSpec() {
         TAG,
         "❌ notifyGlobalRecordingError called with error: ${error.name} - ${error.message}"
       )
-      instance?.globalRecordingErrorCallback?.invoke(error)
+      instance?.let { recorder ->
+        recorder.pendingGlobalStop?.completeExceptionally(
+          IllegalStateException("GLOBAL_STOP_FAILED:${error.name}: ${error.message}")
+        )
+        recorder.globalRecordingErrorCallback?.invoke(error)
+      }
     }
   }
 
@@ -407,46 +420,51 @@ class NitroScreenRecorder : HybridNitroScreenRecorderSpec() {
 
   override fun stopGlobalRecording(settledTimeMs: Double): Promise<ScreenRecordingFile?> {
     return Promise.async {
-      val ctx = NitroModules.applicationContext
-      if (ctx == null) {
-        throw Error("NO_CONTEXT")
-      }
-
-      val service = globalRecordingService
-      val hasActiveSession = service?.hasActiveSession() == true
-      val enabledMic = service?.isMicrophoneEnabled() == true
-      val separateAudio = service?.isSeparateAudioEnabled() == true
-      val sessionActive = ScreenRecordingService.isSessionActive
-
-      if (!hasActiveSession && !sessionActive) {
-        throw Error("NO_ACTIVE_RECORDING_SESSION")
-      }
-
-      if (hasActiveSession || sessionActive) {
-        Log.d(TAG, "🛑 Stopping recording service (bound: $isServiceBound, hasSession: $hasActiveSession, sessionActive: $sessionActive)")
-
-        val stopIntent = Intent(ctx, ScreenRecordingService::class.java).apply {
-          action = ScreenRecordingService.ACTION_STOP_RECORDING
+      globalStopMutex.withLock {
+        val ctx = NitroModules.applicationContext
+        if (ctx == null) {
+          throw Error("NO_CONTEXT")
         }
-        ctx.startService(stopIntent)
-      }
 
-      if (isServiceBound) {
-        try {
-          ctx.unbindService(serviceConnection)
-        } catch (e: Exception) {
-          Log.w(TAG, "Service already unbound: ${e.message}")
+        val service = globalRecordingService
+        val hasActiveSession = service?.hasActiveSession() == true
+        val enabledMic = service?.isMicrophoneEnabled() == true
+        val separateAudio = service?.isSeparateAudioEnabled() == true
+        val sessionActive = ScreenRecordingService.isSessionActive
+
+        if (!hasActiveSession && !sessionActive) {
+          throw Error("NO_ACTIVE_RECORDING_SESSION")
         }
-        isServiceBound = false
-      }
 
-      globalRecordingService = null
+        val completion = CompletableDeferred<File?>()
+        pendingGlobalStop = completion
+        val rawFile = try {
+          Log.d(TAG, "🛑 Stopping recording service (bound: $isServiceBound, hasSession: $hasActiveSession, sessionActive: $sessionActive)")
 
-      delay(settledTimeMs.toLong())
+          val stopIntent = Intent(ctx, ScreenRecordingService::class.java).apply {
+            action = ScreenRecordingService.ACTION_STOP_RECORDING
+          }
+          ctx.startService(stopIntent)
+          withTimeout(10_000) { completion.await() }
+        } finally {
+          pendingGlobalStop = null
+          if (isServiceBound) {
+            try {
+              ctx.unbindService(serviceConnection)
+            } catch (e: Exception) {
+              Log.w(TAG, "Service already unbound: ${e.message}")
+            }
+            isServiceBound = false
+          }
+          globalRecordingService = null
+        }
+        if (rawFile == null) throw Error("NO_RECORDING_FILE_AFTER_STOP")
+        if (!rawFile.exists()) throw Error("NO_RECORDING_FILE_AFTER_STOP")
 
-      // Post-process the raw recording file (optimize + extract audio)
-      val rawFile = lastGlobalRecording
-      if (rawFile != null && rawFile.exists()) {
+        delay(settledTimeMs.toLong())
+
+        // Post-process the raw recording file (optimize + extract audio)
+        var audioFile: File? = null
         val optimized = RecorderUtils.optimizeForStreaming(rawFile)
         lastGlobalRecording = optimized
 
@@ -456,48 +474,49 @@ class NitroScreenRecorder : HybridNitroScreenRecorderSpec() {
           val audioOutputFile = RecorderUtils.createAudioOutputFile(recordingsDir, "global_recording_audio")
           val extracted = RecorderUtils.extractAudioFromVideo(optimized, audioOutputFile)
           if (extracted) {
-            lastGlobalAudioRecording = audioOutputFile
+            audioFile = audioOutputFile
           } else {
             audioOutputFile.delete()
           }
         }
+        lastGlobalAudioRecording = audioFile
+        lastGlobalRecordingEnabledMicrophone = enabledMic
+        return@async getGlobalRecordingFile(optimized, audioFile, enabledMic)
+          ?: throw Error("NO_RECORDING_FILE_AFTER_STOP")
       }
-
-      return@async retrieveLastGlobalRecording()
-        ?: throw Error("NO_RECORDING_FILE_AFTER_STOP")
     }
   }
 
   override fun retrieveLastGlobalRecording(): ScreenRecordingFile? {
-    return lastGlobalRecording?.let { file ->
-      if (file.exists()) {
-        // Build audio file info if available
-        val audioFile = lastGlobalAudioRecording?.let { audioFile ->
-          if (audioFile.exists()) {
-            AudioRecordingFile(
-              path = "file://${audioFile.absolutePath}",
-              name = audioFile.name,
-              size = audioFile.length().toDouble(),
-              duration = RecorderUtils.getAudioDuration(audioFile)
-            )
-          } else {
-            null
-          }
-        }
-        
-        ScreenRecordingFile(
-          path = "file://${file.absolutePath}",
-          name = file.name,
-          size = file.length().toDouble(),
-          duration = RecorderUtils.getVideoDuration(file),
-          enabledMicrophone = lastGlobalRecordingEnabledMicrophone,
-          audioFile = audioFile,
-          appAudioFile = null  // App audio capture not supported on Android
+    return lastGlobalRecording?.let {
+      getGlobalRecordingFile(it, lastGlobalAudioRecording, lastGlobalRecordingEnabledMicrophone)
+    }
+  }
+
+  private fun getGlobalRecordingFile(file: File, audio: File?, enabledMic: Boolean): ScreenRecordingFile? {
+    if (!file.exists()) return null
+    val audioFile = audio?.let { audioFile ->
+      if (audioFile.exists()) {
+        AudioRecordingFile(
+          path = "file://${audioFile.absolutePath}",
+          name = audioFile.name,
+          size = audioFile.length().toDouble(),
+          duration = RecorderUtils.getAudioDuration(audioFile)
         )
       } else {
         null
       }
     }
+
+    return ScreenRecordingFile(
+      path = "file://${file.absolutePath}",
+      name = file.name,
+      size = file.length().toDouble(),
+      duration = RecorderUtils.getVideoDuration(file),
+      enabledMicrophone = enabledMic,
+      audioFile = audioFile,
+      appAudioFile = null  // App audio capture not supported on Android
+    )
   }
 
   override fun retrieveGlobalRecording(chunkId: String?): ScreenRecordingFile? {
