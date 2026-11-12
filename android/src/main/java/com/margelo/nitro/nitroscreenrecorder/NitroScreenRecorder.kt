@@ -458,7 +458,7 @@ class NitroScreenRecorder : HybridNitroScreenRecorderSpec() {
           }
           globalRecordingService = null
         }
-        if (rawFile == null) return@async null
+        if (rawFile == null) throw Error("NO_RECORDING_FILE_AFTER_STOP")
         if (!rawFile.exists()) throw Error("NO_RECORDING_FILE_AFTER_STOP")
 
         delay(settledTimeMs.toLong())

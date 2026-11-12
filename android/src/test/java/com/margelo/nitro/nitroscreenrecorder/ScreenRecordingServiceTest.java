@@ -304,7 +304,9 @@ public class ScreenRecordingServiceTest {
     File previous = service.finalizeChunk();
     ReflectionHelpers.setField(bridge, "lastGlobalRecording", previous);
     PromiseShadow promise = Shadow.extract(bridge.stopGlobalRecording(0));
-    assertNull(promise.outcome.get(5, TimeUnit.SECONDS));
+    ExecutionException error = assertThrows(ExecutionException.class,
+        () -> promise.outcome.get(5, TimeUnit.SECONDS));
+    assertEquals("NO_RECORDING_FILE_AFTER_STOP", error.getCause().getMessage());
     assertTrue(previous.exists());
   }
 
