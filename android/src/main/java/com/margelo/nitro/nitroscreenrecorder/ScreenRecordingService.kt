@@ -345,10 +345,10 @@ class ScreenRecordingService : Service() {
         type = RecordingEventType.GLOBAL,
         reason = RecordingEventReason.ENDED
       )
-      NitroScreenRecorder.notifyGlobalRecordingEvent(event)
       cleanup()
       stopForeground(true)
       stopSelf(this.startId)
+      NitroScreenRecorder.notifyGlobalRecordingEvent(event)
       return null
     }
 
@@ -358,6 +358,7 @@ class ScreenRecordingService : Service() {
     }
 
     var recordingFile: File? = null
+    var failure: RecordingError? = null
 
     try {
       mediaRecorder?.stop()
@@ -367,11 +368,10 @@ class ScreenRecordingService : Service() {
       runCatching { currentRecordingFile?.delete() }.onFailure { e.addSuppressed(it) }
       Log.e(TAG, "❌ Error stopping global recording: ${e.message}")
       e.printStackTrace()
-      val error = RecordingError(
+      failure = RecordingError(
         name = "RecordingStopError",
         message = e.message ?: "Failed to stop recording"
       )
-      NitroScreenRecorder.notifyGlobalRecordingError(error)
     } finally {
       isRecording = false
       currentRecordingFile = null
@@ -380,15 +380,16 @@ class ScreenRecordingService : Service() {
         type = RecordingEventType.GLOBAL,
         reason = RecordingEventReason.ENDED
       )
+      cleanup()
+      stopForeground(true)
+      stopSelf(this.startId)
+      failure?.let { NitroScreenRecorder.notifyGlobalRecordingError(it) }
       if (recordingFile != null) {
         NitroScreenRecorder.notifyGlobalRecordingFinished(recordingFile, null, event, enableMic)
       } else {
         NitroScreenRecorder.notifyGlobalRecordingEvent(event)
       }
 
-      cleanup()
-      stopForeground(true)
-      stopSelf(this.startId)
     }
 
     return recordingFile

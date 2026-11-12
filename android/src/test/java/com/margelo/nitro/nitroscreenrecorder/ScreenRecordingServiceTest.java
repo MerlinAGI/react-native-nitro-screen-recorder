@@ -58,6 +58,7 @@ public class ScreenRecordingServiceTest {
     RecorderShadow.failure = new IllegalStateException("injected recorder failure");
     RecorderShadow.onStart = null;
     RecorderShadow.onStop = null;
+    RecorderShadow.onRelease = null;
     RecorderShadow.hasReleaseFailure = false;
     service = Robolectric.buildService(ScreenRecordingService.class).create().get();
     VirtualDisplay virtualDisplay = Shadow.newInstanceOf(VirtualDisplay.class);
@@ -71,6 +72,7 @@ public class ScreenRecordingServiceTest {
   public void tearDown() {
     RecorderShadow.onStart = null;
     RecorderShadow.onStop = null;
+    RecorderShadow.onRelease = null;
     RecorderShadow.hasReleaseFailure = false;
     ReflectionHelpers.setStaticField(NitroScreenRecorder.class, "instance", null);
     NitroModules.setApplicationContext(null);
@@ -310,6 +312,32 @@ public class ScreenRecordingServiceTest {
     assertTrue(previous.exists());
   }
 
+  @Test
+  public void bridgeWaitsForNativeTeardownBeforeReturningTheStoppedFile() throws Exception {
+    NitroScreenRecorder bridge = createBridge();
+    service.markChunkStart();
+    CountDownLatch releasing = new CountDownLatch(1);
+    CountDownLatch allowRelease = new CountDownLatch(1);
+    RecorderShadow.onRelease = () -> {
+      releasing.countDown();
+      try {
+        if (!allowRelease.await(5, TimeUnit.SECONDS)) throw new AssertionError("Release was not allowed");
+      } catch (InterruptedException error) {
+        Thread.currentThread().interrupt();
+        throw new AssertionError(error);
+      }
+    };
+    PromiseShadow promise = Shadow.extract(bridge.stopGlobalRecording(0));
+    try {
+      assertTrue(releasing.await(5, TimeUnit.SECONDS));
+      assertThrows(TimeoutException.class, () -> promise.outcome.get(100, TimeUnit.MILLISECONDS));
+    } finally {
+      allowRelease.countDown();
+      assertNotNull(promise.outcome.get(5, TimeUnit.SECONDS));
+    }
+    assertFalse(service.hasActiveSession());
+  }
+
   private NitroScreenRecorder createBridge() {
     NitroModules.setApplicationContext(new BridgeReactContext(service) {
       @Override public ComponentName startService(Intent intent) {
@@ -462,6 +490,7 @@ public class ScreenRecordingServiceTest {
     static String failureStage;
     static Runnable onStart;
     static Runnable onStop;
+    static Runnable onRelease;
     static boolean hasReleaseFailure;
     boolean didStop;
     int stopCount;
@@ -497,6 +526,7 @@ public class ScreenRecordingServiceTest {
 
     @Implementation
     protected void release() {
+      if (onRelease != null) onRelease.run();
       super.release();
       if (hasReleaseFailure) throw new IllegalStateException("injected release failure");
     }
