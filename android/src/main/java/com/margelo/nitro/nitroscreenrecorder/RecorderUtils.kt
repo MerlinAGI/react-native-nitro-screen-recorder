@@ -163,6 +163,7 @@ object RecorderUtils {
     }
 
     // Use .m4a extension for extracted audio (AAC in MPEG-4 container)
+    // Atomically reserves prefix + random identifier + .m4a to prevent extractions from overwriting or deleting each other's audio.
     val file = File.createTempFile("${prefix}_", ".m4a", directory)
     Log.d(TAG, "📁 Created audio output file: ${file.absolutePath}")
     return file
