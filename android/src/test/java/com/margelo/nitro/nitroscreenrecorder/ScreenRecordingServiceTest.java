@@ -3,8 +3,11 @@ package com.margelo.nitro.nitroscreenrecorder;
 import static org.junit.Assert.*;
 
 import android.app.Notification;
+import android.content.ComponentName;
+import android.content.Intent;
 import android.hardware.display.VirtualDisplay;
 import android.media.MediaRecorder;
+import android.media.projection.MediaProjection;
 import android.util.Log;
 import android.view.Surface;
 import java.io.File;
@@ -12,11 +15,14 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -31,10 +37,14 @@ import org.robolectric.shadows.ShadowMediaRecorder;
 import org.robolectric.shadows.ShadowLog;
 import org.robolectric.shadows.ShadowService;
 import org.robolectric.util.ReflectionHelpers;
+import com.facebook.react.bridge.BridgeReactContext;
+import com.margelo.nitro.NitroModules;
+import com.margelo.nitro.core.Promise;
 
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk = 28, shadows = {ScreenRecordingServiceTest.RecorderShadow.class,
-    ScreenRecordingServiceTest.DisplayShadow.class})
+    ScreenRecordingServiceTest.DisplayShadow.class, ScreenRecordingServiceTest.SpecShadow.class,
+    ScreenRecordingServiceTest.PromiseShadow.class, ScreenRecordingServiceTest.NitroLoaderShadow.class})
 public class ScreenRecordingServiceTest {
   private ScreenRecordingService service;
   private DisplayShadow display;
@@ -45,7 +55,10 @@ public class ScreenRecordingServiceTest {
     ShadowLog.clear();
     RecorderShadow.recorders.clear();
     RecorderShadow.failureStage = null;
+    RecorderShadow.failure = new IllegalStateException("injected recorder failure");
     RecorderShadow.onStart = null;
+    RecorderShadow.onStop = null;
+    RecorderShadow.onRelease = null;
     RecorderShadow.hasReleaseFailure = false;
     service = Robolectric.buildService(ScreenRecordingService.class).create().get();
     VirtualDisplay virtualDisplay = Shadow.newInstanceOf(VirtualDisplay.class);
@@ -58,7 +71,11 @@ public class ScreenRecordingServiceTest {
   @After
   public void tearDown() {
     RecorderShadow.onStart = null;
+    RecorderShadow.onStop = null;
+    RecorderShadow.onRelease = null;
     RecorderShadow.hasReleaseFailure = false;
+    ReflectionHelpers.setStaticField(NitroScreenRecorder.class, "instance", null);
+    NitroModules.setApplicationContext(null);
     service.onDestroy();
     File[] files = directory.listFiles();
     if (files != null) Arrays.stream(files).forEach(File::delete);
@@ -182,6 +199,227 @@ public class ScreenRecordingServiceTest {
   }
 
   @Test
+  public void failedStopRejectsOnceAndAllowsANewChunk() {
+    service.markChunkStart();
+    RecorderShadow failed = RecorderShadow.recorders.get(0);
+    RecorderShadow.failureStage = "stop";
+
+    IllegalStateException failure = assertThrows(IllegalStateException.class, service::finalizeChunk);
+    assertTrue(failure.getMessage().startsWith("CHUNK_FINALIZE_FAILED:stop"));
+    assertSame(RecorderShadow.failure, failure.getCause());
+    assertFalse(service.isCapturingChunk());
+    assertFalse(service.isCurrentlyRecording());
+    assertEquals(0.0, service.getChunkStartedAt(), 0.0);
+    assertEquals(ShadowMediaRecorder.STATE_RELEASED, failed.getState());
+    assertFalse(new File(failed.getOutputPath()).exists());
+    assertNull(service.finalizeChunk());
+    assertEquals(1, failed.stopCount);
+    assertFalse(ShadowLog.getLogsForTag("NitroScreenRecorder").stream().anyMatch(
+        entry -> entry.msg.contains("notifyGlobalRecordingError")));
+
+    RecorderShadow.failureStage = null;
+    service.markChunkStart();
+    File next = service.finalizeChunk();
+    assertNotNull(next);
+    assertTrue(next.exists());
+    assertNotEquals(failed.getOutputPath(), next.getAbsolutePath());
+  }
+
+  @Test
+  public void failedGlobalStopDoesNotPublishAnInvalidFile() {
+    service.markChunkStart();
+    RecorderShadow.failureStage = "stop";
+    assertNull(service.stopRecording());
+    assertFalse(service.isCapturingChunk());
+    assertFalse(service.isCurrentlyRecording());
+    assertEquals(ShadowMediaRecorder.STATE_RELEASED, RecorderShadow.recorders.get(0).getState());
+    assertFalse(new File(RecorderShadow.recorders.get(0).getOutputPath()).exists());
+    assertFalse(ShadowLog.getLogsForTag("NitroScreenRecorder").stream().anyMatch(
+        entry -> entry.msg.contains("notifyGlobalRecordingFinished")));
+  }
+
+  @Test
+  public void bridgeRejectsFailedStopInsteadOfReturningPreviousChunk() throws Exception {
+    NitroScreenRecorder bridge = createBridge();
+    service.markChunkStart();
+    File previous = service.finalizeChunk();
+    ReflectionHelpers.setField(bridge, "lastGlobalRecording", previous);
+    service.markChunkStart();
+    RecorderShadow.failureStage = "stop";
+
+    PromiseShadow promise = Shadow.extract(bridge.stopGlobalRecording(0));
+    ExecutionException error = assertThrows(ExecutionException.class,
+        () -> promise.outcome.get(5, TimeUnit.SECONDS));
+    assertTrue(error.getCause().getMessage().contains("GLOBAL_STOP_FAILED:RecordingStopError"));
+    assertTrue(error.getCause().getMessage().contains("injected recorder failure"));
+    assertTrue(previous.exists());
+    assertFalse(new File(RecorderShadow.recorders.get(1).getOutputPath()).exists());
+    assertFalse(service.hasActiveSession());
+  }
+
+  @Test
+  public void bridgeReturnsCurrentSuccessfulStopAfterPreviousChunk() throws Exception {
+    NitroScreenRecorder bridge = createBridge();
+    service.markChunkStart();
+    File previous = service.finalizeChunk();
+    ReflectionHelpers.setField(bridge, "lastGlobalRecording", previous);
+    ScreenRecordingFile previousResult = bridge.retrieveLastGlobalRecording();
+    service.markChunkStart();
+    String currentPath = RecorderShadow.recorders.get(1).getOutputPath();
+
+    PromiseShadow promise = Shadow.extract(bridge.stopGlobalRecording(0));
+    Object result = promise.outcome.get(5, TimeUnit.SECONDS);
+    assertNotNull(result);
+    assertNotEquals(previousResult, result);
+    assertEquals(bridge.retrieveLastGlobalRecording(), result);
+    assertEquals("file://" + currentPath, bridge.retrieveLastGlobalRecording().getPath());
+  }
+
+  @Test
+  public void bridgeWaitsForStopCompletionInsteadOfReadingPreviousChunk() throws Exception {
+    NitroScreenRecorder bridge = createBridge();
+    service.markChunkStart();
+    File previous = service.finalizeChunk();
+    ReflectionHelpers.setField(bridge, "lastGlobalRecording", previous);
+    service.markChunkStart();
+    CountDownLatch requested = new CountDownLatch(1);
+    NitroModules.setApplicationContext(new BridgeReactContext(service) {
+      @Override public ComponentName startService(Intent intent) {
+        requested.countDown();
+        return new ComponentName(service, ScreenRecordingService.class);
+      }
+    });
+    PromiseShadow promise = Shadow.extract(bridge.stopGlobalRecording(0));
+    try {
+      assertTrue(requested.await(5, TimeUnit.SECONDS));
+      assertThrows(TimeoutException.class, () -> promise.outcome.get(100, TimeUnit.MILLISECONDS));
+    } finally {
+      service.stopRecording();
+      assertNotNull(promise.outcome.get(5, TimeUnit.SECONDS));
+    }
+  }
+
+  @Test
+  public void bridgeStoppingBetweenChunksDoesNotReturnPreviousChunk() throws Exception {
+    NitroScreenRecorder bridge = createBridge();
+    service.markChunkStart();
+    File previous = service.finalizeChunk();
+    ReflectionHelpers.setField(bridge, "lastGlobalRecording", previous);
+    PromiseShadow promise = Shadow.extract(bridge.stopGlobalRecording(0));
+    ExecutionException error = assertThrows(ExecutionException.class,
+        () -> promise.outcome.get(5, TimeUnit.SECONDS));
+    assertEquals("NO_RECORDING_FILE_AFTER_STOP", error.getCause().getMessage());
+    assertTrue(previous.exists());
+  }
+
+  @Test
+  public void bridgeWaitsForNativeTeardownBeforeReturningTheStoppedFile() throws Exception {
+    NitroScreenRecorder bridge = createBridge();
+    service.markChunkStart();
+    CountDownLatch releasing = new CountDownLatch(1);
+    CountDownLatch allowRelease = new CountDownLatch(1);
+    RecorderShadow.onRelease = () -> {
+      releasing.countDown();
+      try {
+        if (!allowRelease.await(5, TimeUnit.SECONDS)) throw new AssertionError("Release was not allowed");
+      } catch (InterruptedException error) {
+        Thread.currentThread().interrupt();
+        throw new AssertionError(error);
+      }
+    };
+    PromiseShadow promise = Shadow.extract(bridge.stopGlobalRecording(0));
+    try {
+      assertTrue(releasing.await(5, TimeUnit.SECONDS));
+      assertThrows(TimeoutException.class, () -> promise.outcome.get(100, TimeUnit.MILLISECONDS));
+    } finally {
+      allowRelease.countDown();
+      assertNotNull(promise.outcome.get(5, TimeUnit.SECONDS));
+    }
+    assertFalse(service.hasActiveSession());
+  }
+
+  private NitroScreenRecorder createBridge() {
+    NitroModules.setApplicationContext(new BridgeReactContext(service) {
+      @Override public ComponentName startService(Intent intent) {
+        service.onStartCommand(intent, 0, 42);
+        return new ComponentName(service, ScreenRecordingService.class);
+      }
+    });
+    NitroScreenRecorder bridge = new NitroScreenRecorder();
+    ReflectionHelpers.setField(bridge, "globalRecordingService", service);
+    ReflectionHelpers.setField(service, "mediaProjection", Shadow.newInstanceOf(MediaProjection.class));
+    return bridge;
+  }
+
+  @Implements(HybridNitroScreenRecorderSpec.class)
+  public static class SpecShadow {
+    @Implementation protected void __constructor__() {}
+  }
+
+  @Implements(Promise.class)
+  public static class PromiseShadow {
+    final CompletableFuture<Object> outcome = new CompletableFuture<>();
+    @Implementation protected void __constructor__() {}
+    @Implementation protected void nativeResolve(Object result) { outcome.complete(result); }
+    @Implementation protected void nativeReject(Throwable error) { outcome.completeExceptionally(error); }
+  }
+
+  @Implements(className = "com.margelo.nitro.JNIOnLoad", isInAndroidSdk = false)
+  public static class NitroLoaderShadow {
+    @Implementation protected static void initializeNativeNitro() {}
+  }
+
+  @Test
+  public void failedDetachTerminatesSessionAndReleasesRecorder() {
+    service.markChunkStart();
+    display.failuresRemaining = 1;
+    IllegalStateException failure = assertThrows(IllegalStateException.class, service::finalizeChunk);
+    assertTrue(failure.getMessage().startsWith("CHUNK_FINALIZE_FAILED:detach-surface"));
+    assertTrue(display.isReleased);
+    assertEquals(ShadowMediaRecorder.STATE_RELEASED, RecorderShadow.recorders.get(0).getState());
+    assertFalse(new File(RecorderShadow.recorders.get(0).getOutputPath()).exists());
+    assertFalse(service.isCapturingChunk());
+    assertThrows(IllegalStateException.class, service::markChunkStart);
+  }
+
+  @Test
+  public void failedReleasePreservesStopFailureAndTerminatesSession() {
+    service.markChunkStart();
+    RecorderShadow.failureStage = "stop";
+    RecorderShadow.hasReleaseFailure = true;
+    IllegalStateException failure = assertThrows(IllegalStateException.class, service::finalizeChunk);
+    assertSame(RecorderShadow.failure, failure.getCause());
+    assertTrue(failure.getCause().getSuppressed().length > 0);
+    assertTrue(display.isReleased);
+    assertFalse(new File(RecorderShadow.recorders.get(0).getOutputPath()).exists());
+    assertFalse(service.isCapturingChunk());
+    assertThrows(IllegalStateException.class, service::markChunkStart);
+  }
+
+  @Test
+  public void projectionStopBetweenChunksPreventsRestartOnAnExpiredSession() {
+    ReflectionHelpers.setField(service, "mediaProjection", Shadow.newInstanceOf(MediaProjection.class));
+    service.markChunkStart();
+    File completed = service.finalizeChunk();
+    MediaProjection.Callback callback = ReflectionHelpers.getField(service, "mediaProjectionCallback");
+    callback.onStop();
+    assertFalse(service.hasActiveSession());
+    assertTrue(display.isReleased);
+    assertTrue(completed.exists());
+    assertThrows(IllegalStateException.class, service::markChunkStart);
+  }
+
+  @Test
+  public void repeatedFinalizeDoesNotStopOrDeleteTheCompletedChunk() {
+    service.markChunkStart();
+    File completed = service.finalizeChunk();
+    assertNull(service.finalizeChunk());
+    assertNull(service.stopRecording());
+    assertEquals(1, RecorderShadow.recorders.get(0).stopCount);
+    assertTrue(completed.exists());
+  }
+
+  @Test
   public void finalizationWaitsForStartupToFinish() throws Exception {
     assertWaitsForStartup(service::finalizeChunk);
   }
@@ -191,12 +429,30 @@ public class ScreenRecordingServiceTest {
     assertWaitsForStartup(service::stopRecording);
   }
 
+  @Test
+  public void globalStopWaitsForFinalizationAndKeepsCompletedFile() throws Exception {
+    ReflectionHelpers.setField(service, "mediaProjection", Shadow.newInstanceOf(MediaProjection.class));
+    service.markChunkStart();
+    RecorderShadow recording = RecorderShadow.recorders.get(0);
+    assertWaitsForRecorderOperation(service::finalizeChunk, service::stopRecording,
+        hook -> RecorderShadow.onStop = hook);
+    assertEquals(1, recording.stopCount);
+    assertTrue(new File(recording.getOutputPath()).exists());
+    assertFalse(service.hasActiveSession());
+  }
+
   private void assertWaitsForStartup(Runnable finish) throws Exception {
+    assertWaitsForRecorderOperation(service::markChunkStart, finish,
+        hook -> RecorderShadow.onStart = hook);
+  }
+
+  private void assertWaitsForRecorderOperation(Runnable start, Runnable finish,
+      Consumer<Runnable> setHook) throws Exception {
     CountDownLatch started = new CountDownLatch(1);
     CountDownLatch allowStart = new CountDownLatch(1);
     CountDownLatch finishRequested = new CountDownLatch(1);
     ExecutorService executor = Executors.newFixedThreadPool(2);
-    RecorderShadow.onStart = () -> {
+    setHook.accept(() -> {
       started.countDown();
       try {
         if (!allowStart.await(5, TimeUnit.SECONDS)) throw new AssertionError("Start was not released");
@@ -204,9 +460,9 @@ public class ScreenRecordingServiceTest {
         Thread.currentThread().interrupt();
         throw new AssertionError(error);
       }
-    };
+    });
     try {
-      Future<?> starting = executor.submit(service::markChunkStart);
+      Future<?> starting = executor.submit(start);
       assertTrue(started.await(5, TimeUnit.SECONDS));
       Future<?> finishing = executor.submit(() -> {
         finishRequested.countDown();
@@ -230,11 +486,14 @@ public class ScreenRecordingServiceTest {
   @Implements(MediaRecorder.class)
   public static class RecorderShadow extends ShadowMediaRecorder {
     static final List<RecorderShadow> recorders = new ArrayList<>();
-    static final RuntimeException failure = new IllegalStateException("injected recorder failure");
+    static RuntimeException failure;
     static String failureStage;
     static Runnable onStart;
+    static Runnable onStop;
+    static Runnable onRelease;
     static boolean hasReleaseFailure;
     boolean didStop;
+    int stopCount;
 
     @Implementation
     protected void setOutputFile(String path) {
@@ -259,11 +518,15 @@ public class ScreenRecordingServiceTest {
     @Implementation
     protected void stop() {
       didStop = true;
+      stopCount++;
+      if (onStop != null) onStop.run();
+      if ("stop".equals(failureStage)) throw failure;
       super.stop();
     }
 
     @Implementation
     protected void release() {
+      if (onRelease != null) onRelease.run();
       super.release();
       if (hasReleaseFailure) throw new IllegalStateException("injected release failure");
     }

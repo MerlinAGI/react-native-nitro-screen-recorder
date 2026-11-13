@@ -58,9 +58,7 @@ class ScreenRecordingService : Service() {
   private val mediaProjectionCallback = object : MediaProjection.Callback() {
     override fun onStop() {
       Log.d(TAG, "📱 MediaProjection stopped")
-      if (isRecording) {
-        stopRecording()
-      }
+      stopRecording()
     }
     
     // Android 14+ (API 34): Called when captured content visibility changes
@@ -347,10 +345,10 @@ class ScreenRecordingService : Service() {
         type = RecordingEventType.GLOBAL,
         reason = RecordingEventReason.ENDED
       )
-      NitroScreenRecorder.notifyGlobalRecordingEvent(event)
       cleanup()
       stopForeground(true)
       stopSelf(this.startId)
+      NitroScreenRecorder.notifyGlobalRecordingEvent(event)
       return null
     }
 
@@ -360,35 +358,38 @@ class ScreenRecordingService : Service() {
     }
 
     var recordingFile: File? = null
+    var failure: RecordingError? = null
 
     try {
       mediaRecorder?.stop()
+      recordingFile = currentRecordingFile
       Log.d(TAG, "🎉 Global screen recording stopped successfully")
     } catch (e: Exception) {
+      runCatching { currentRecordingFile?.delete() }.onFailure { e.addSuppressed(it) }
       Log.e(TAG, "❌ Error stopping global recording: ${e.message}")
       e.printStackTrace()
-      val error = RecordingError(
+      failure = RecordingError(
         name = "RecordingStopError",
         message = e.message ?: "Failed to stop recording"
       )
-      NitroScreenRecorder.notifyGlobalRecordingError(error)
     } finally {
       isRecording = false
-      recordingFile = currentRecordingFile
+      currentRecordingFile = null
 
       val event = ScreenRecordingEvent(
         type = RecordingEventType.GLOBAL,
         reason = RecordingEventReason.ENDED
       )
+      cleanup()
+      stopForeground(true)
+      stopSelf(this.startId)
+      failure?.let { NitroScreenRecorder.notifyGlobalRecordingError(it) }
       if (recordingFile != null) {
         NitroScreenRecorder.notifyGlobalRecordingFinished(recordingFile, null, event, enableMic)
       } else {
         NitroScreenRecorder.notifyGlobalRecordingEvent(event)
       }
 
-      cleanup()
-      stopForeground(true)
-      stopSelf(this.startId)
     }
 
     return recordingFile
@@ -533,46 +534,64 @@ class ScreenRecordingService : Service() {
       return null
     }
 
-    var chunkFile: File? = null
+    val recorder = mediaRecorder ?: return null
+    val chunkFile = currentRecordingFile
+    var stage = "detach-surface"
+    var didDetachSurface = false
+    var failure: Exception? = null
 
     try {
       val chunkEndedAt = System.currentTimeMillis() / 1000.0
       val chunkDuration = chunkEndedAt - chunkStartedAt
       Log.d(TAG, "📦 Chunk duration: ${chunkDuration}s (from $chunkStartedAt to $chunkEndedAt)")
-
-      // IMPORTANT: Set surface to null FIRST to stop receiving new frames
-      // This prevents frames from being sent to a recorder that's being stopped
       virtualDisplay?.setSurface(null)
-      Log.d(TAG, "📦 VirtualDisplay surface cleared (paused)")
-
-      // Now stop and release the recorder
-      mediaRecorder?.stop()
-      mediaRecorder?.release()
-      mediaRecorder = null
-
-      chunkFile = currentRecordingFile
-      currentRecordingFile = null
-
-      // Update state - chunk done, but recording session still active
-      isCapturing = false
-      chunkStartedAt = 0.0
-      // Keep isRecording = false to indicate paused state
-      // MediaProjection stays alive for next markChunkStart()
-      isRecording = false
-
-      Log.d(TAG, "📦 Chunk finalized: ${chunkFile?.absolutePath}")
-      Log.d(TAG, "ℹ️ Call markChunkStart() to begin next chunk, or stopGlobalRecording() to end session")
-
+      didDetachSurface = true
+      stage = "stop"
+      recorder.stop()
     } catch (e: Exception) {
-      Log.e(TAG, "❌ Error in finalizeChunk: ${e.message}")
-      e.printStackTrace()
-      val error = RecordingError(
-        name = "ChunkFinalizeError",
-        message = e.message ?: "Failed to finalize chunk"
-      )
-      NitroScreenRecorder.notifyGlobalRecordingError(error)
+      failure = e
+    } finally {
+      mediaRecorder = null
+      currentRecordingFile = null
+      isCapturing = false
+      isRecording = false
+      chunkStartedAt = 0.0
+
+      var didReleaseRecorder = false
+      try {
+        recorder.release()
+        didReleaseRecorder = true
+      } catch (e: Exception) {
+        val originalFailure = failure
+        if (originalFailure == null) {
+          stage = "release"
+          failure = e
+        } else {
+          originalFailure.addSuppressed(e)
+        }
+      }
+
+      if (!didDetachSurface || !didReleaseRecorder) {
+        cleanup()
+        runCatching { stopForeground(true) }.onFailure { Log.w(TAG, "Failed to stop foreground recording", it) }
+        runCatching { stopSelf(this.startId) }.onFailure { Log.w(TAG, "Failed to stop recording service", it) }
+        runCatching {
+          NitroScreenRecorder.notifyGlobalRecordingEvent(ScreenRecordingEvent(
+            type = RecordingEventType.GLOBAL,
+            reason = RecordingEventReason.ENDED
+          ))
+        }.onFailure { failure?.addSuppressed(it) }
+      }
     }
 
+    failure?.let { cause ->
+      runCatching { chunkFile?.delete() }.onFailure { cause.addSuppressed(it) }
+      Log.e(TAG, "❌ Error in finalizeChunk at $stage: ${cause.message}", cause)
+      // The caller owns chunk recovery; the global callback would stop its retry.
+      throw IllegalStateException("CHUNK_FINALIZE_FAILED:$stage: $cause", cause)
+    }
+
+    Log.d(TAG, "📦 Chunk finalized: ${chunkFile?.absolutePath}")
     return chunkFile
   }
 
