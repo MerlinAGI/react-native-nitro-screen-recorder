@@ -26,6 +26,7 @@ class ScreenRecordingService : Service() {
   private var mediaProjection: MediaProjection? = null
   private var mediaRecorder: MediaRecorder? = null
   private var virtualDisplay: VirtualDisplay? = null
+  private var observationRouter: RecordingSurfaceRouter? = null
   private var isRecording = false
   private var currentRecordingFile: File? = null
   private var enableMic = false
@@ -105,6 +106,8 @@ class ScreenRecordingService : Service() {
     const val EXTRA_RESULT_DATA = "RESULT_DATA"
     const val EXTRA_ENABLE_MIC = "ENABLE_MIC"
     const val EXTRA_SEPARATE_AUDIO = "SEPARATE_AUDIO"
+
+    var observationRouterFactory: ((() -> Unit) -> RecordingSurfaceRouter)? = null
 
     @Volatile
     var isSessionActive = false
@@ -300,7 +303,7 @@ class ScreenRecordingService : Service() {
         recordingProfile.height,
         screenDensity,
         DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-        mediaRecorder?.surface,
+        mediaRecorder?.surface?.let { recordingSurface(it) },
         null,
         null
       )
@@ -332,6 +335,31 @@ class ScreenRecordingService : Service() {
       cleanup()
       stopSelf(this.startId)
     }
+  }
+
+  private fun recordingSurface(surface: android.view.Surface): android.view.Surface {
+    return try {
+      if (observationRouter == null) {
+        observationRouter = observationRouterFactory?.invoke {
+          mainHandler.post { restoreDirectRecording() }
+        }
+      }
+      observationRouter?.attach(surface, recordingProfile.width, recordingProfile.height) ?: surface
+    } catch (_: Exception) {
+      Log.w(TAG, "Observation unavailable; keeping direct recording")
+      runCatching { observationRouter?.close() }
+      observationRouter = null
+      surface
+    }
+  }
+
+  @Synchronized
+  private fun restoreDirectRecording() {
+    val failedRouter = observationRouter
+    observationRouter = null
+    runCatching { virtualDisplay?.setSurface(null) }
+    runCatching { failedRouter?.close() }
+    runCatching { virtualDisplay?.setSurface(if (isRecording) mediaRecorder?.surface else null) }
   }
 
   @Synchronized
@@ -456,7 +484,7 @@ class ScreenRecordingService : Service() {
       stage = "attach-surface"
       val newSurface = recorder.surface
       didAttemptSurfaceSwap = true
-      display.setSurface(newSurface)
+      display.setSurface(recordingSurface(newSurface))
       Log.d(TAG, "📍 VirtualDisplay surface swapped to new recorder")
 
       mediaRecorder = recorder
@@ -466,7 +494,7 @@ class ScreenRecordingService : Service() {
       chunkStartedAt = System.currentTimeMillis() / 1000.0
     } catch (e: Exception) {
       if (didAttemptSurfaceSwap) {
-        runCatching { display.setSurface(oldSurface) }.onFailure {
+        runCatching { display.setSurface(oldRecorder?.surface?.let { recordingSurface(it) } ?: oldSurface) }.onFailure {
           e.addSuppressed(it)
           // An unconfirmed surface cannot remain advertised as active capture.
           runCatching { oldRecorder?.stop() }.onFailure { e.addSuppressed(it) }
@@ -546,6 +574,7 @@ class ScreenRecordingService : Service() {
       Log.d(TAG, "📦 Chunk duration: ${chunkDuration}s (from $chunkStartedAt to $chunkEndedAt)")
       virtualDisplay?.setSurface(null)
       didDetachSurface = true
+      runCatching { observationRouter?.detach() }
       stage = "stop"
       recorder.stop()
     } catch (e: Exception) {
@@ -626,6 +655,8 @@ class ScreenRecordingService : Service() {
       Log.e(TAG, "❌ Error releasing VirtualDisplay: ${e.message}")
     }
     virtualDisplay = null
+    runCatching { observationRouter?.close() }
+    observationRouter = null
 
     try {
       mediaRecorder?.release()
