@@ -209,6 +209,7 @@ export declare function flushChunk(chunkId?: string): Promise<number>;
  */
 export declare function finalizeChunk(chunkId?: string, options?: {
     settledTimeMs: number;
+    onFinalizeError?: (error: Error) => void;
 }): Promise<ScreenRecordingFile | undefined>;
 /**
  * Retrieves the most recently completed global recording file.

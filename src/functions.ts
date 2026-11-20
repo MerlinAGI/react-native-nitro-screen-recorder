@@ -362,6 +362,7 @@ export async function finalizeChunk(
   chunkId?: string,
   options?: {
     settledTimeMs: number;
+    onFinalizeError?: (error: Error) => void;
   }
 ): Promise<ScreenRecordingFile | undefined> {
   let settledTimeMs = 500;
@@ -390,6 +391,11 @@ export async function finalizeChunk(
         error.message.includes('NO_FINALIZED_CHUNK_FILE') ||
         error.message.includes('FINALIZED_CHUNK_FILE_MISSING'))
     ) {
+      try {
+        options?.onFinalizeError?.(error);
+      } catch {
+        // Diagnostics must not change the native result.
+      }
       return undefined;
     }
     throw error;
