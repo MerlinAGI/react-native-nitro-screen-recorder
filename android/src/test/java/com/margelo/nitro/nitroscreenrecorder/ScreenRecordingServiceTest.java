@@ -53,6 +53,7 @@ public class ScreenRecordingServiceTest {
   @Before
   public void setUp() {
     ScreenRecordingService.Companion.setObservationRouterFactory(null);
+    ScreenRecordingService.Companion.getObservationChunkId().set(null);
     ShadowLog.clear();
     RecorderShadow.recorders.clear();
     RecorderShadow.failureStage = null;
@@ -79,6 +80,7 @@ public class ScreenRecordingServiceTest {
     NitroModules.setApplicationContext(null);
     service.onDestroy();
     ScreenRecordingService.Companion.setObservationRouterFactory(null);
+    ScreenRecordingService.Companion.getObservationChunkId().set(null);
     File[] files = directory.listFiles();
     if (files != null) Arrays.stream(files).forEach(File::delete);
   }
@@ -104,11 +106,124 @@ public class ScreenRecordingServiceTest {
     public void close() { closeCount++; }
   }
 
+  private void startObservedChunk() {
+    ScreenRecordingService.Companion.getObservationChunkId().set("observed-chunk");
+    service.markChunkStart("observed-chunk");
+  }
+
+  @Test
+  public void queuedObservationCannotEnableAnotherChunk() {
+    SurfaceRouter router = new SurfaceRouter();
+    ScreenRecordingService.Companion.setObservationRouterFactory(onFailure -> router);
+    ScreenRecordingService.Companion.getObservationChunkId().set("observed-chunk");
+    service.markChunkStart("disabled-chunk");
+    assertNotSame(router.input, display.surface);
+    assertTrue(service.finalizeChunk().exists());
+    service.markChunkStart("observed-chunk");
+    assertSame(router.input, display.surface);
+    assertNull(ScreenRecordingService.Companion.getObservationChunkId().get());
+    assertTrue(service.finalizeChunk().exists());
+    service.markChunkStart("observed-chunk");
+    assertNotSame(router.input, display.surface);
+    assertTrue(service.finalizeChunk().exists());
+  }
+
+  @Test
+  public void staleObservationFailureCannotDetachTheNextDirectChunk() {
+    assertStaleObservationFailureIsIgnored(false);
+  }
+
+  @Test
+  public void staleObservationFailureCannotCloseAReplacementRouter() {
+    assertStaleObservationFailureIsIgnored(true);
+  }
+
+  private void assertStaleObservationFailureIsIgnored(boolean shouldObserveNext) {
+    List<SurfaceRouter> routers = new ArrayList<>();
+    List<kotlin.jvm.functions.Function0<kotlin.Unit>> failures = new ArrayList<>();
+    ScreenRecordingService.Companion.setObservationRouterFactory(onFailure -> {
+      SurfaceRouter router = new SurfaceRouter();
+      routers.add(router);
+      failures.add(onFailure);
+      return router;
+    });
+    startObservedChunk();
+    assertTrue(service.finalizeChunk().exists());
+    service.markChunkStart();
+    if (shouldObserveNext) {
+      assertTrue(service.finalizeChunk().exists());
+      startObservedChunk();
+    }
+    Surface currentSurface = display.surface;
+    int surfaceChanges = display.surfaceChanges;
+    failures.get(0).invoke();
+    org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle();
+    assertSame(currentSurface, display.surface);
+    assertEquals(surfaceChanges, display.surfaceChanges);
+    if (shouldObserveNext) assertEquals(0, routers.get(1).closeCount);
+    assertTrue(service.isCapturingChunk());
+    assertTrue(service.finalizeChunk().exists());
+  }
+
+  @Test
+  public void rejectedObservedSwapKeepsThePreviousDirectRecording() {
+    SurfaceRouter router = new SurfaceRouter();
+    ScreenRecordingService.Companion.setObservationRouterFactory(onFailure -> router);
+    service.markChunkStart();
+    Surface direct = display.surface;
+    display.failuresRemaining = 1;
+    assertThrows(IllegalStateException.class, this::startObservedChunk);
+    assertSame(direct, display.surface);
+    assertEquals(1, router.closeCount);
+    assertNull(ScreenRecordingService.Companion.getObservationChunkId().get());
+    assertTrue(service.isCapturingChunk());
+    assertTrue(service.finalizeChunk().exists());
+  }
+
+  @Test
+  public void observationDefaultsToDirectRecordingWithoutConstructingTheRouter() {
+    ScreenRecordingService.Companion.setObservationRouterFactory(onFailure -> {
+      throw new AssertionError("Disabled observation must not construct a router");
+    });
+    service.markChunkStart();
+    assertNotNull(display.surface);
+    assertTrue(service.isCapturingChunk());
+    assertTrue(service.finalizeChunk().exists());
+  }
+
+  @Test
+  public void disabledChunkAfterObservationClosesTheRouterAndRecordsDirectly() {
+    SurfaceRouter router = new SurfaceRouter();
+    ScreenRecordingService.Companion.setObservationRouterFactory(onFailure -> router);
+    startObservedChunk();
+    assertSame(router.input, display.surface);
+    assertTrue(service.finalizeChunk().exists());
+
+    service.markChunkStart();
+    assertNotSame(router.input, display.surface);
+    assertNotNull(display.surface);
+    assertEquals(1, router.closeCount);
+    assertTrue(service.isCapturingChunk());
+    assertTrue(service.finalizeChunk().exists());
+
+    startObservedChunk();
+    assertSame(router.input, display.surface);
+    assertTrue(service.finalizeChunk().exists());
+  }
+
+  @Test
+  public void endingTheSessionClearsTheObservationOptIn() {
+    startObservedChunk();
+    ScreenRecordingService.Companion.getObservationChunkId().set("pending-chunk");
+    service.onDestroy();
+    assertNull(ScreenRecordingService.Companion.getObservationChunkId().get());
+  }
+
   @Test
   public void routedCaptureFinalizesAndResumesWithoutReplacingTheDisplay() {
     SurfaceRouter router = new SurfaceRouter();
     ScreenRecordingService.Companion.setObservationRouterFactory(onFailure -> router);
-    service.markChunkStart();
+    startObservedChunk();
     assertSame(router.input, display.surface);
     assertNotNull(router.output);
     Surface firstOutput = router.output;
@@ -119,7 +234,7 @@ public class ScreenRecordingServiceTest {
     assertEquals(1, router.detachCount);
     assertEquals(0, router.closeCount);
 
-    service.markChunkStart();
+    startObservedChunk();
     assertSame(router.input, display.surface);
     assertNotSame(firstOutput, router.output);
     assertTrue(service.finalizeChunk().exists());
@@ -132,7 +247,7 @@ public class ScreenRecordingServiceTest {
     SurfaceRouter router = new SurfaceRouter();
     router.hasAttachFailure = true;
     ScreenRecordingService.Companion.setObservationRouterFactory(onFailure -> router);
-    service.markChunkStart();
+    startObservedChunk();
     assertNotSame(router.input, display.surface);
     assertNotNull(display.surface);
     assertEquals(1, router.closeCount);
@@ -148,7 +263,7 @@ public class ScreenRecordingServiceTest {
       failures.add(onFailure);
       return router;
     });
-    service.markChunkStart();
+    startObservedChunk();
     failures.get(0).invoke();
     org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle();
     assertSame(router.output, display.surface);
@@ -161,7 +276,7 @@ public class ScreenRecordingServiceTest {
   public void rejectedRoutedSwapRestoresThePreviousRecorder() {
     SurfaceRouter router = new SurfaceRouter();
     ScreenRecordingService.Companion.setObservationRouterFactory(onFailure -> router);
-    service.markChunkStart();
+    startObservedChunk();
     Surface previousOutput = router.output;
     display.failuresRemaining = 1;
     assertThrows(IllegalStateException.class, service::markChunkStart);
@@ -626,6 +741,7 @@ public class ScreenRecordingServiceTest {
   public static class DisplayShadow {
     Surface surface;
     int failuresRemaining;
+    int surfaceChanges;
     boolean isReleased;
 
     @Implementation
@@ -633,6 +749,7 @@ public class ScreenRecordingServiceTest {
 
     @Implementation
     protected void setSurface(Surface next) {
+      surfaceChanges++;
       surface = next;
       if (failuresRemaining > 0) {
         failuresRemaining--;
