@@ -415,21 +415,12 @@ object RecorderUtils {
         }
       }
 
-      // Replace original with optimized version
-      if (inputFile.delete()) {
-        if (tempFile.renameTo(inputFile)) {
-          Log.d(TAG, "✅ MP4 optimization complete: ${inputFile.absolutePath}")
-          return inputFile
-        } else {
-          Log.e(TAG, "❌ Failed to rename optimized file")
-          tempFile.delete()
-          return inputFile
-        }
-      } else {
-        Log.e(TAG, "❌ Failed to delete original file")
+      // Same-directory rename preserves the source if replacement fails.
+      if (!tempFile.renameTo(inputFile)) {
+        Log.w(TAG, "MP4 replacement failed; preserving the original recording")
         tempFile.delete()
-        return inputFile
       }
+      return inputFile
 
     } catch (e: com.margelo.nitro.nitroscreenrecorder.QtFastStart.QtFastStartException) {
       Log.e(TAG, "❌ QtFastStart error: ${e.message}", e)
