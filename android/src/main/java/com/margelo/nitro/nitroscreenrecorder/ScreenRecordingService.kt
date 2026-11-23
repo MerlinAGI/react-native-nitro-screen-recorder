@@ -376,6 +376,10 @@ class ScreenRecordingService : Service() {
     runCatching { virtualDisplay?.setSurface(null) }
     runCatching { failedRouter?.close() }
     runCatching { virtualDisplay?.setSurface(if (isRecording) mediaRecorder?.surface else null) }
+      .onFailure {
+        Log.e(TAG, "Failed to restore direct recording after observation failure", it)
+        stopRecording()
+      }
   }
 
   @Synchronized
@@ -505,7 +509,20 @@ class ScreenRecordingService : Service() {
       stage = "attach-surface"
       val newSurface = recorder.surface
       didAttemptSurfaceSwap = true
-      display.setSurface(recordingSurface(newSurface, shouldObserve))
+      try {
+        display.setSurface(recordingSurface(newSurface, shouldObserve))
+      } catch (routingFailure: Exception) {
+        if (observationRouter == null) throw routingFailure
+        Log.w(TAG, "Observation surface rejected; keeping direct recording", routingFailure)
+        runCatching { display.setSurface(null) }
+        val directSurface = recordingSurface(newSurface)
+        try {
+          display.setSurface(directSurface)
+        } catch (directFailure: Exception) {
+          directFailure.addSuppressed(routingFailure)
+          throw directFailure
+        }
+      }
       Log.d(TAG, "📍 VirtualDisplay surface swapped to new recorder")
 
       mediaRecorder = recorder

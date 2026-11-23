@@ -171,12 +171,57 @@ public class ScreenRecordingServiceTest {
     ScreenRecordingService.Companion.setObservationRouterFactory(onFailure -> router);
     service.markChunkStart();
     Surface direct = display.surface;
-    display.failuresRemaining = 1;
+    display.nonNullFailuresRemaining = 2;
     assertThrows(IllegalStateException.class, this::startObservedChunk);
     assertSame(direct, display.surface);
     assertEquals(1, router.closeCount);
     assertNull(ScreenRecordingService.Companion.getObservationChunkId().get());
     assertTrue(service.isCapturingChunk());
+    assertTrue(service.finalizeChunk().exists());
+  }
+
+  @Test
+  public void rejectedObservationAfterFinalizeFallsBackToDirectRecording() {
+    SurfaceRouter router = new SurfaceRouter();
+    ScreenRecordingService.Companion.setObservationRouterFactory(onFailure -> router);
+    service.markChunkStart();
+    File previous = service.finalizeChunk();
+    display.failuresRemaining = 1;
+
+    startObservedChunk();
+
+    assertEquals(1, router.closeCount);
+    assertNotSame(router.input, display.surface);
+    assertSame(router.output, display.surface);
+    assertTrue(service.isCapturingChunk());
+    assertTrue(previous.exists());
+    assertTrue(service.finalizeChunk().exists());
+  }
+
+  @Test
+  public void rejectedObservationAndDirectSurfaceAfterFinalizeCloseTheRouter() {
+    List<SurfaceRouter> routers = new ArrayList<>();
+    ScreenRecordingService.Companion.setObservationRouterFactory(onFailure -> {
+      SurfaceRouter router = new SurfaceRouter();
+      routers.add(router);
+      return router;
+    });
+    service.markChunkStart();
+    File previous = service.finalizeChunk();
+    display.nonNullFailuresRemaining = 2;
+
+    assertThrows(IllegalStateException.class, this::startObservedChunk);
+
+    assertEquals(1, routers.get(0).closeCount);
+    assertNull(display.surface);
+    assertFalse(service.isCapturingChunk());
+    assertTrue(previous.exists());
+    RecorderShadow rejected = RecorderShadow.recorders.get(1);
+    assertEquals(ShadowMediaRecorder.STATE_RELEASED, rejected.getState());
+    assertFalse(new File(rejected.getOutputPath()).exists());
+    startObservedChunk();
+    assertEquals(2, routers.size());
+    assertSame(routers.get(1).input, display.surface);
     assertTrue(service.finalizeChunk().exists());
   }
 
@@ -270,6 +315,40 @@ public class ScreenRecordingServiceTest {
     assertEquals(1, router.closeCount);
     assertTrue(service.isCapturingChunk());
     assertTrue(service.finalizeChunk().exists());
+  }
+
+  @Test
+  public void failedDirectRecoveryStopsCaptureAndPreservesTheRecording() {
+    service.onStartCommand(null, 0, 42);
+    service.startForeground(1001, new Notification.Builder(service, "screen_recording_channel").build());
+    ShadowService serviceState = Shadow.extract(service);
+    SurfaceRouter router = new SurfaceRouter();
+    List<kotlin.jvm.functions.Function0<kotlin.Unit>> failures = new ArrayList<>();
+    ScreenRecordingService.Companion.setObservationRouterFactory(onFailure -> {
+      failures.add(onFailure);
+      return router;
+    });
+    startObservedChunk();
+    RecorderShadow recorder = RecorderShadow.recorders.get(0);
+    display.failedSurface = router.output;
+
+    failures.get(0).invoke();
+    org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle();
+
+    assertEquals(1, router.closeCount);
+    assertTrue(display.isReleased);
+    assertFalse(service.isCapturingChunk());
+    assertFalse(service.isCurrentlyRecording());
+    assertTrue(serviceState.isForegroundStopped());
+    assertTrue(serviceState.isStoppedBySelf());
+    assertEquals(42, serviceState.getStopSelfId());
+    assertTrue(recorder.didStop);
+    assertEquals(ShadowMediaRecorder.STATE_RELEASED, recorder.getState());
+    assertTrue(new File(recorder.getOutputPath()).exists());
+    assertTrue(ShadowLog.getLogsForTag("ScreenRecordingService").stream().anyMatch(
+        entry -> entry.type == Log.ERROR && entry.throwable != null));
+    assertTrue(ShadowLog.getLogsForTag("NitroScreenRecorder").stream().anyMatch(
+        entry -> entry.msg.contains("notifyGlobalRecordingFinished")));
   }
 
   @Test
@@ -740,7 +819,9 @@ public class ScreenRecordingServiceTest {
   @Implements(VirtualDisplay.class)
   public static class DisplayShadow {
     Surface surface;
+    Surface failedSurface;
     int failuresRemaining;
+    int nonNullFailuresRemaining;
     int surfaceChanges;
     boolean isReleased;
 
@@ -751,6 +832,13 @@ public class ScreenRecordingServiceTest {
     protected void setSurface(Surface next) {
       surfaceChanges++;
       surface = next;
+      if (next != null && next == failedSurface) {
+        throw new IllegalStateException("injected direct surface failure");
+      }
+      if (next != null && nonNullFailuresRemaining > 0) {
+        nonNullFailuresRemaining--;
+        throw new IllegalStateException("injected non-null surface failure");
+      }
       if (failuresRemaining > 0) {
         failuresRemaining--;
         throw new IllegalStateException("injected surface failure");
